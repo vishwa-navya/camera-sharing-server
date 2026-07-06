@@ -21,7 +21,6 @@ const express    = require("express");
 const http       = require("http");
 const { Server } = require("socket.io");
 const crypto     = require("crypto");
-const fetch      = require("node-fetch");
 
 const app    = express();
 const server = http.createServer(app);
