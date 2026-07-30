@@ -1,7 +1,7 @@
 /**
- * server.js — Production-Grade Signaling Server v3.0
+ * server.js — Production-Grade Signaling Server v3.1
  *
- * Architecture Improvements:
+ * Architecture:
  * 1. Call State Machine — prevents race conditions, invalid states
  * 2. Perfect Negotiation — prevents offer collisions
  * 3. Session Persistence — call survives socket disconnects
@@ -15,6 +15,9 @@
  * 11. Typing via Socket.IO — zero latency
  * 12. Mood Cleanup — server-side expiry
  * 13. FCM Push Notifications — server-side sending
+ * 14. Screen Sharing — NEW: full desktop/window sharing with audio
+ *
+ * Note: Uses Node.js built-in fetch (Node 18+) — no node-fetch package needed
  */
 
 const express    = require("express");
@@ -30,39 +33,34 @@ const server = http.createServer(app);
 // ============================================================================
 
 const CONFIG = {
-  // Timeouts (milliseconds)
-  HEALTH_PING_INTERVAL:     15000,   // Ping every 15s
-  HEALTH_PONG_TIMEOUT:      5000,    // Expect pong within 5s
-  CALL_TIMEOUT:             60000,   // Ring for 60s max
-  ICE_GATHERING_TIMEOUT:    10000,   // Max ICE gathering time
-  NEGOTIATION_TIMEOUT:      15000,   // Max negotiation time
-  RECONNECT_TIMEOUT:        10000,   // Max reconnect time
+  HEALTH_PING_INTERVAL:     15000,
+  HEALTH_PONG_TIMEOUT:      5000,
+  CALL_TIMEOUT:             60000,
+  ICE_GATHERING_TIMEOUT:    10000,
+  NEGOTIATION_TIMEOUT:      15000,
+  RECONNECT_TIMEOUT:        10000,
 
-  // Retries
   MAX_RETRIES:              3,
   RETRY_BASE_DELAY:         500,
   RETRY_MAX_DELAY:          5000,
 
-  // Cleanup
-  SESSION_TTL:              300000,  // 5 minutes
-  MESSAGE_DEDUP_TTL:        30000,   // 30 seconds
-  INACTIVE_SOCKET_TTL:      60000,   // 1 minute without pong
+  SESSION_TTL:              300000,
+  MESSAGE_DEDUP_TTL:        30000,
+  INACTIVE_SOCKET_TTL:      60000,
 
-  // Feature flags
   PERFECT_NEGOTIATION:      true,
   SESSION_PERSISTENCE:      true,
   HEALTH_MONITORING:        true,
 
-  // Rate Limiting (requests per minute)
   RATE_LIMITS: {
-    MESSAGES:       60,    // 60 messages/minute
-    TYPING:         120,   // 120 typing events/minute
-    CALLS:          10,    // 10 calls/minute
-    MEDIA_UPLOADS:  20,    // 20 uploads/minute
-    GENERAL:        200,   // 200 general events/minute
+    MESSAGES:       60,
+    TYPING:         120,
+    CALLS:          10,
+    MEDIA_UPLOADS:  20,
+    SCREEN_SHARE:   10,
+    GENERAL:        200,
   },
 
-  // Firebase (for mood cleanup and FCM)
   FIREBASE_PROJECT_ID: 'lastseen-8800e',
 };
 
@@ -70,59 +68,43 @@ const CONFIG = {
 // RATE LIMITING
 // ============================================================================
 
-const rateLimits = new Map(); // userId -> { events: [timestamps], blockedUntil }
+const rateLimits = new Map();
 
 function checkRateLimit(userId, eventType = 'GENERAL') {
   const now = Date.now();
   const limit = CONFIG.RATE_LIMITS[eventType] || CONFIG.RATE_LIMITS.GENERAL;
-  const windowMs = 60000; // 1 minute window
+  const windowMs = 60000;
 
-  if (!rateLimits.has(userId)) {
-    rateLimits.set(userId, {});
-  }
-
+  if (!rateLimits.has(userId)) rateLimits.set(userId, {});
   const userLimits = rateLimits.get(userId);
-
-  if (!userLimits[eventType]) {
-    userLimits[eventType] = { events: [], blockedUntil: 0 };
-  }
+  if (!userLimits[eventType]) userLimits[eventType] = { events: [], blockedUntil: 0 };
 
   const limitData = userLimits[eventType];
 
-  // Check if blocked
   if (limitData.blockedUntil > now) {
     return { allowed: false, retryAfter: limitData.blockedUntil - now };
   }
 
-  // Clean old events
   limitData.events = limitData.events.filter(ts => now - ts < windowMs);
 
-  // Check limit
   if (limitData.events.length >= limit) {
-    // Block for 30 seconds
     limitData.blockedUntil = now + 30000;
-    console.warn(`[RateLimit] ${userId} blocked for ${eventType} (too many requests)`);
+    console.warn(`[RateLimit] ${userId} blocked for ${eventType}`);
     return { allowed: false, retryAfter: 30000 };
   }
 
-  // Add event
   limitData.events.push(now);
   return { allowed: true };
 }
 
-// Clean up old rate limit entries every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [userId, limits] of rateLimits) {
     for (const [type, data] of Object.entries(limits)) {
       data.events = data.events.filter(ts => now - ts < 60000);
-      if (data.events.length === 0 && data.blockedUntil < now) {
-        delete limits[type];
-      }
+      if (data.events.length === 0 && data.blockedUntil < now) delete limits[type];
     }
-    if (Object.keys(limits).length === 0) {
-      rateLimits.delete(userId);
-    }
+    if (Object.keys(limits).length === 0) rateLimits.delete(userId);
   }
 }, 300000);
 
@@ -130,21 +112,19 @@ setInterval(() => {
 // STATE MANAGEMENT
 // ============================================================================
 
-// Call State Machine
 const CALL_STATES = {
   IDLE:         'idle',
   JOINING:      'joining',
-  WAITING:      'waiting',      // Caller waiting for answer
-  RINGING:      'ringing',      // Callee receiving call
-  CONNECTING:   'connecting',   // WebRTC connecting
-  NEGOTIATING:  'negotiating',  // Offer/Answer exchange
-  CONNECTED:    'connected',    // Call active
-  RECONNECTING: 'reconnecting', // Same as connecting (for clarity)
-  RECOVERING:   'recovering',  // Restoring from disconnect
+  WAITING:      'waiting',
+  RINGING:      'ringing',
+  CONNECTING:   'connecting',
+  NEGOTIATING:  'negotiating',
+  CONNECTED:    'connected',
+  RECONNECTING: 'reconnecting',
+  RECOVERING:   'recovering',
   ENDED:        'ended',
 };
 
-// Valid state transitions
 const VALID_TRANSITIONS = {
   [CALL_STATES.IDLE]:         [CALL_STATES.JOINING],
   [CALL_STATES.JOINING]:      [CALL_STATES.WAITING, CALL_STATES.RINGING, CALL_STATES.ENDED],
@@ -158,69 +138,44 @@ const VALID_TRANSITIONS = {
   [CALL_STATES.ENDED]:        [CALL_STATES.IDLE],
 };
 
-// Active sessions (persists across socket reconnects)
 const sessions = {
-  // callId -> CallSession
-  calls: new Map(),
-
-  // socketId -> SocketMeta
-  sockets: new Map(),
-
-  // userName -> Set<socketId> (multi-device)
-  users: new Map(),
-
-  // messageHash -> timestamp (deduplication)
+  calls:        new Map(),
+  sockets:      new Map(),
+  users:        new Map(),
   messageCache: new Map(),
-
-  // Call history (in-memory, also persisted to Firebase)
-  callHistory: [],
-
-  // FCM tokens: userName -> token
-  fcmTokens: new Map(),
+  callHistory:  [],
+  fcmTokens:    new Map(),
 };
 
-// Call Session structure
+// NEW: Screen share room state (separate from camera rooms)
+const shareRooms = {}; // { roomId: { socketId: userName } }
+
+// Camera sharing room state (existing)
+const cameraRooms = {}; // { roomId: { socketId: userName } }
+
 class CallSession {
   constructor(callId, type, caller, callee) {
-    this.callId = callId;
-    this.type = type; // 'video' | 'voice'
-    this.caller = caller;
-    this.callee = callee;
-    this.state = CALL_STATES.IDLE;
-    this.createdAt = Date.now();
-    this.updatedAt = Date.now();
-    this.connectedAt = null;    // When call actually connects
-    this.endedAt = null;         // When call ends
-    this.endReason = null;       // Reason call ended
-
-    // Perfect Negotiation: polite peer rolls back on collision
-    // Caller is polite, callee is impolite (or vice versa)
-    this.politePeer = caller; // Who rolls back
-
-    // WebRTC state
-    this.offerer = null;
-    this.lastOffer = null;
-    this.lastAnswer = null;
+    this.callId       = callId;
+    this.type         = type;
+    this.caller       = caller;
+    this.callee       = callee;
+    this.state        = CALL_STATES.IDLE;
+    this.createdAt    = Date.now();
+    this.updatedAt    = Date.now();
+    this.connectedAt  = null;
+    this.endedAt       = null;
+    this.endReason    = null;
+    this.politePeer   = caller;
+    this.offerer      = null;
+    this.lastOffer    = null;
+    this.lastAnswer   = null;
     this.iceCandidates = { [caller]: [], [callee]: [] };
-
-    // Connected socket IDs
-    this.sockets = {
-      [caller]: new Set(),
-      [callee]: new Set(),
-    };
-
-    // Media state
-    this.mediaState = {
+    this.sockets      = { [caller]: new Set(), [callee]: new Set() };
+    this.mediaState   = {
       [caller]: { video: false, audio: false },
       [callee]: { video: false, audio: false },
     };
-
-    // Timers
-    this.timers = {
-      call: null,
-      negotiation: null,
-      reconnect: null,
-    };
+    this.timers = { call: null, negotiation: null, reconnect: null };
   }
 
   canTransitionTo(newState) {
@@ -238,33 +193,27 @@ class CallSession {
     return false;
   }
 
-  getOtherUser(user) {
-    return user === this.caller ? this.callee : this.caller;
-  }
-
-  isParticipant(user) {
-    return user === this.caller || user === this.callee;
-  }
+  getOtherUser(user) { return user === this.caller ? this.callee : this.caller; }
+  isParticipant(user) { return user === this.caller || user === this.callee; }
 }
 
-// Socket metadata
 class SocketMeta {
   constructor(socketId, userName) {
-    this.socketId = socketId;
-    this.userName = userName;
-    this.connectedAt = Date.now();
-    this.lastPong = Date.now();
-    this.pingLatency = 0;
-    this.callId = null;
-    this.isHealthy = true;
-    this.pingSentAt = null;
-    this.pongReceived = false;
-    this.lastActivity = Date.now();
+    this.socketId      = socketId;
+    this.userName      = userName;
+    this.connectedAt   = Date.now();
+    this.lastPong      = Date.now();
+    this.pingLatency   = 0;
+    this.callId        = null;
+    this.isHealthy     = true;
+    this.pingSentAt    = null;
+    this.pongReceived  = false;
+    this.lastActivity  = Date.now();
   }
 }
 
 // ============================================================================
-// FIREBASE HELPERS (for mood cleanup, call history, FCM)
+// FIREBASE HELPERS
 // ============================================================================
 
 async function writeToFirestore(collection, docId, data) {
@@ -273,16 +222,11 @@ async function writeToFirestore(collection, docId, data) {
     const fields = {};
     for (const [key, value] of Object.entries(data)) {
       if (value === null || value === undefined) continue;
-      if (typeof value === 'string') {
-        fields[key] = { stringValue: value };
-      } else if (typeof value === 'number') {
-        fields[key] = { integerValue: value.toString() };
-      } else if (typeof value === 'boolean') {
-        fields[key] = { booleanValue: value };
-      } else if (value instanceof Date) {
-        fields[key] = { timestampValue: value.toISOString() };
-      } else if (typeof value === 'object') {
-        // Skip invalid values
+      if (typeof value === 'string')       fields[key] = { stringValue: value };
+      else if (typeof value === 'number')  fields[key] = { integerValue: value.toString() };
+      else if (typeof value === 'boolean') fields[key] = { booleanValue: value };
+      else if (value instanceof Date)      fields[key] = { timestampValue: value.toISOString() };
+      else if (typeof value === 'object') {
         if (key === 'expiresAt' && value && value.toDate) {
           fields[key] = { timestampValue: value.toDate().toISOString() };
         }
@@ -308,51 +252,17 @@ async function deleteFromFirestore(collection, docId) {
   }
 }
 
-async function queryFirestore(collection, filter = null) {
-  try {
-    // Simple approach: we can't do complex queries via REST easily
-    // So we'll use a different approach for mood cleanup
-    const url = `https://firestore.googleapis.com/v1/projects/${CONFIG.FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}`;
-    const response = await fetch(url);
-    const data = await response.json();
-    return data.documents || [];
-  } catch (err) {
-    console.error('[Firestore] Query error:', err.message);
-    return [];
-  }
-}
-
-// Send FCM push notification
 async function sendFCMNotification(fcmToken, title, body, data = {}) {
-  if (!fcmToken) {
-    console.warn('[FCM] No token provided');
-    return false;
-  }
-
+  if (!fcmToken) { console.warn('[FCM] No token provided'); return false; }
   try {
-    // Use Firebase REST API or a server key approach
-    // For now, we'll store the token for server-side sending
-    // The actual FCM send requires a server key which should be in env vars
     const serverKey = process.env.FCM_SERVER_KEY;
-    if (!serverKey) {
-      console.warn('[FCM] No server key configured - notifications disabled');
-      return false;
-    }
+    if (!serverKey) { console.warn('[FCM] No server key configured'); return false; }
 
     const response = await fetch('https://fcm.googleapis.com/fcm/send', {
       method: 'POST',
-      headers: {
-        'Authorization': `key=${serverKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        to: fcmToken,
-        notification: { title, body },
-        data,
-        priority: 'high',
-      }),
+      headers: { 'Authorization': `key=${serverKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: fcmToken, notification: { title, body }, data, priority: 'high' }),
     });
-
     const result = await response.json();
     console.log('[FCM] Notification sent:', result.success);
     return result.success === 1;
@@ -366,30 +276,15 @@ async function sendFCMNotification(fcmToken, title, body, data = {}) {
 // UTILITIES
 // ============================================================================
 
-function generateCallId() {
-  return `call_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-}
+function generateCallId()    { return `call_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`; }
+function generateMessageId() { return `${Date.now()}_${crypto.randomBytes(3).toString('hex')}`; }
 
-function generateMessageId() {
-  return `${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-}
-
-/**
- * REAL-TIME PRESENCE: Broadcast user online/offline status
- * Immediately notifies all relevant parties
- */
 function broadcastPresence(user, isOnline) {
   const knownUsers = ["Vishwa", "Ammu"];
   const otherUser = knownUsers.find(u => u !== user);
-
   if (otherUser) {
-    const otherSockets = getUserSockets(otherUser);
-    otherSockets.forEach(sid => {
-      io.to(sid).emit("presence-update", {
-        user,
-        isOnline,
-        timestamp: Date.now(),
-      });
+    getUserSockets(otherUser).forEach(sid => {
+      io.to(sid).emit("presence-update", { user, isOnline, timestamp: Date.now() });
     });
     console.log(`[Presence] ${user} is ${isOnline ? "ONLINE" : "OFFLINE"} → notified ${otherUser}`);
   }
@@ -398,44 +293,25 @@ function broadcastPresence(user, isOnline) {
 function dedupeMessage(msgId) {
   const now = Date.now();
   const exists = sessions.messageCache.has(msgId);
-
-  // Clean old entries
   for (const [id, ts] of sessions.messageCache) {
-    if (now - ts > CONFIG.MESSAGE_DEDUP_TTL) {
-      sessions.messageCache.delete(id);
-    }
+    if (now - ts > CONFIG.MESSAGE_DEDUP_TTL) sessions.messageCache.delete(id);
   }
-
-  if (exists) {
-    return false;
-  }
-
+  if (exists) return false;
   sessions.messageCache.set(msgId, now);
   return true;
 }
 
 function addUserSocket(user, socketId) {
-  if (!sessions.users.has(user)) {
-    sessions.users.set(user, new Set());
-  }
+  if (!sessions.users.has(user)) sessions.users.set(user, new Set());
   sessions.users.get(user).add(socketId);
 }
 
 function removeUserSocket(user, socketId) {
   sessions.users.get(user)?.delete(socketId);
-  if (sessions.users.get(user)?.size === 0) {
-    sessions.users.delete(user);
-  }
+  if (sessions.users.get(user)?.size === 0) sessions.users.delete(user);
 }
 
-function getUserSockets(user) {
-  return [...(sessions.users.get(user) ?? [])];
-}
-
-function getUserForSocket(socketId) {
-  const meta = sessions.sockets.get(socketId);
-  return meta?.userName ?? null;
-}
+function getUserSockets(user) { return [...(sessions.users.get(user) ?? [])]; }
 
 function getActiveCallForUser(user) {
   for (const [callId, session] of sessions.calls) {
@@ -451,10 +327,7 @@ function getActiveCallForUser(user) {
 function cleanupSession(callId) {
   const session = sessions.calls.get(callId);
   if (!session) return;
-
-  // Clear timers
   Object.values(session.timers).forEach(t => t && clearTimeout(t));
-
   sessions.calls.delete(callId);
   console.log(`[Call ${callId}] Session cleaned up`);
 }
@@ -465,31 +338,21 @@ function cleanupSession(callId) {
 
 function saveCallToHistory(session, endReason) {
   const callRecord = {
-    callId: session.callId,
-    type: session.type,
-    caller: session.caller,
-    callee: session.callee,
-    createdAt: session.createdAt,
+    callId:      session.callId,
+    type:        session.type,
+    caller:      session.caller,
+    callee:      session.callee,
+    createdAt:   session.createdAt,
     connectedAt: session.connectedAt,
-    endedAt: Date.now(),
-    duration: session.connectedAt ? Date.now() - session.connectedAt : 0,
-    endReason: endReason,
-    didConnect: !!session.connectedAt,
+    endedAt:     Date.now(),
+    duration:    session.connectedAt ? Date.now() - session.connectedAt : 0,
+    endReason,
+    didConnect:  !!session.connectedAt,
   };
-
-  // Save to in-memory history
   sessions.callHistory.push(callRecord);
-
-  // Keep only last 100 calls in memory
-  if (sessions.callHistory.length > 100) {
-    sessions.callHistory = sessions.callHistory.slice(-100);
-  }
-
-  // Save to Firestore for persistence
+  if (sessions.callHistory.length > 100) sessions.callHistory = sessions.callHistory.slice(-100);
   writeToFirestore('callHistory', session.callId, callRecord);
-
   console.log(`[CallHistory] Saved: ${session.caller} → ${session.callee} (${callRecord.duration}ms, ${endReason})`);
-
   return callRecord;
 }
 
@@ -499,37 +362,26 @@ function saveCallToHistory(session, endReason) {
 
 function startHealthCheck(socket) {
   if (!CONFIG.HEALTH_MONITORING) return;
-
   let pingInterval = null;
-  let pongTimeout = null;
+  let pongTimeout  = null;
 
   const sendPing = () => {
-    if (!socket.connected) {
-      clearInterval(pingInterval);
-      clearTimeout(pongTimeout);
-      return;
-    }
-
+    if (!socket.connected) { clearInterval(pingInterval); clearTimeout(pongTimeout); return; }
     const meta = sessions.sockets.get(socket.id);
-    if (meta) {
-      meta.pingSentAt = Date.now();
-      meta.pongReceived = false;
-    }
-
+    if (meta) { meta.pingSentAt = Date.now(); meta.pongReceived = false; }
     socket.emit('ping', { ts: Date.now() });
-
     clearTimeout(pongTimeout);
     pongTimeout = setTimeout(() => {
       const meta = sessions.sockets.get(socket.id);
       if (meta && !meta.pongReceived) {
         meta.isHealthy = false;
-        console.warn(`[Health] ${socket.id} (${meta.userName}) unhealthy - no pong`);
+        console.warn(`[Health] ${socket.id} (${meta.userName}) unhealthy`);
         socket.emit('health-warning', { reason: 'No heartbeat response' });
       }
     }, CONFIG.HEALTH_PONG_TIMEOUT);
   };
 
-  socket.on('pong', (data) => {
+  socket.on('pong', () => {
     const meta = sessions.sockets.get(socket.id);
     if (meta) {
       meta.pongReceived = true;
@@ -543,10 +395,7 @@ function startHealthCheck(socket) {
   pingInterval = setInterval(sendPing, CONFIG.HEALTH_PING_INTERVAL);
   sendPing();
 
-  socket.once('disconnect', () => {
-    clearInterval(pingInterval);
-    clearTimeout(pongTimeout);
-  });
+  socket.once('disconnect', () => { clearInterval(pingInterval); clearTimeout(pongTimeout); });
 }
 
 // ============================================================================
@@ -556,9 +405,6 @@ function startHealthCheck(socket) {
 async function cleanupExpiredMoods() {
   console.log('[MoodCleanup] Checking for expired moods...');
   const now = Date.now();
-
-  // Firebase REST API doesn't support queries well, so we'll use
-  // a simpler approach: check known mood documents
   const chatId = 'privateMessages';
   const users = ['Vishwa', 'Ammu'];
 
@@ -568,13 +414,11 @@ async function cleanupExpiredMoods() {
       const url = `https://firestore.googleapis.com/v1/projects/${CONFIG.FIREBASE_PROJECT_ID}/databases/(default)/documents/moods/${docId}`;
       const response = await fetch(url);
       const data = await response.json();
-
-      if (data.fields && data.fields.expiresAt) {
+      if (data.fields?.expiresAt) {
         let expiresAt;
         if (data.fields.expiresAt.timestampValue) {
           expiresAt = new Date(data.fields.expiresAt.timestampValue).getTime();
         }
-
         if (expiresAt && expiresAt < now) {
           await deleteFromFirestore('moods', docId);
           console.log(`[MoodCleanup] Deleted expired mood for ${user}`);
@@ -586,7 +430,6 @@ async function cleanupExpiredMoods() {
   }
 }
 
-// Run mood cleanup every 5 minutes
 setInterval(cleanupExpiredMoods, 300000);
 console.log('[MoodCleanup] Scheduled every 5 minutes');
 
@@ -595,12 +438,8 @@ console.log('[MoodCleanup] Scheduled every 5 minutes');
 // ============================================================================
 
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true,
-  },
-  pingTimeout: 30000,
+  cors: { origin: "*", methods: ["GET", "POST"], credentials: true },
+  pingTimeout:  30000,
   pingInterval: 25000,
   transports: ['websocket', 'polling'],
 });
@@ -609,34 +448,29 @@ const io = new Server(server, {
 // EXPRESS ROUTES
 // ============================================================================
 
-app.get("/", (req, res) => res.send("Signaling Server v3.0 - Ready"));
+app.get("/", (req, res) => res.send("Signaling Server v3.1 - Ready"));
 
 app.get("/health", (req, res) => res.json({
   ok: true,
-  version: "3.0",
+  version: "3.1",
   uptime: process.uptime(),
   activeCalls: sessions.calls.size,
   connectedSockets: sessions.sockets.size,
   callHistoryCount: sessions.callHistory.length,
+  activeScreenShares: Object.keys(shareRooms).length,
 }));
 
-// Wake-up endpoint (called when app loads)
 app.post("/wake", express.json(), (req, res) => {
-  // Immediately respond to wake the server
   res.json({ awake: true, ts: Date.now() });
   console.log('[Wake] Server woke up');
 });
 
-// Get call history
 app.get("/call-history/:user", async (req, res) => {
   const { user } = req.params;
-  const userCalls = sessions.callHistory.filter(
-    c => c.caller === user || c.callee === user
-  );
-  res.json({ calls: userCalls.slice(-50) }); // Last 50 calls
+  const userCalls = sessions.callHistory.filter(c => c.caller === user || c.callee === user);
+  res.json({ calls: userCalls.slice(-50) });
 });
 
-// Register FCM token
 app.post("/fcm-token", express.json(), (req, res) => {
   const { user, token } = req.body;
   if (user && token) {
@@ -648,16 +482,24 @@ app.post("/fcm-token", express.json(), (req, res) => {
   }
 });
 
-// Trigger FCM notification (for testing)
 app.post("/notify", express.json(), async (req, res) => {
   const { user, title, body, data } = req.body;
   const token = sessions.fcmTokens.get(user);
-  if (!token) {
-    return res.status(404).json({ error: 'User token not found' });
-  }
+  if (!token) return res.status(404).json({ error: 'User token not found' });
   const sent = await sendFCMNotification(token, title, body, data);
   res.json({ sent });
 });
+
+// Self-ping every 9 minutes to prevent Render free tier sleep
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || "https://camera-sharing-server.onrender.com";
+setInterval(async () => {
+  try {
+    await fetch(`${SELF_URL}/health`, { signal: AbortSignal.timeout(8000) });
+    console.log("💓 Self-ping OK");
+  } catch (e) {
+    console.log("⚠️ Self-ping failed:", e.message);
+  }
+}, 9 * 60 * 1000);
 
 // ============================================================================
 // CALL MANAGEMENT
@@ -665,17 +507,14 @@ app.post("/notify", express.json(), async (req, res) => {
 
 function createCallSession(type, caller, callee) {
   const existingCall = getActiveCallForUser(caller);
-  if (existingCall) {
-    return { error: 'CALL_EXISTS', callId: existingCall.callId };
-  }
+  if (existingCall) return { error: 'CALL_EXISTS', callId: existingCall.callId };
 
   const callId = generateCallId();
   const session = new CallSession(callId, type, caller, callee);
   sessions.calls.set(callId, session);
 
   session.timers.call = setTimeout(() => {
-    if (session.state !== CALL_STATES.CONNECTED &&
-        session.state !== CALL_STATES.ENDED) {
+    if (session.state !== CALL_STATES.CONNECTED && session.state !== CALL_STATES.ENDED) {
       console.log(`[Call ${callId}] Timed out`);
       endCall(session, 'TIMEOUT');
     }
@@ -685,15 +524,10 @@ function createCallSession(type, caller, callee) {
   return session;
 }
 
-function initiateCall(session, callerSocketId) {
+function initiateCall(session) {
   session.setState(CALL_STATES.JOINING);
-
-  const callee = session.callee;
-  const calleeSockets = getUserSockets(callee);
-
-  if (calleeSockets.length === 0) {
-    return { error: 'USER_OFFLINE' };
-  }
+  const calleeSockets = getUserSockets(session.callee);
+  if (calleeSockets.length === 0) return { error: 'USER_OFFLINE' };
 
   session.setState(CALL_STATES.WAITING);
   session.offerer = session.caller;
@@ -703,7 +537,7 @@ function initiateCall(session, callerSocketId) {
       callId: session.callId,
       type: session.type,
       from: session.caller,
-      polite: session.caller === session.politePeer ? callee : session.caller,
+      polite: session.caller === session.politePeer ? session.callee : session.caller,
     });
   });
 
@@ -711,44 +545,28 @@ function initiateCall(session, callerSocketId) {
 }
 
 function acceptCall(session, calleeSocketId) {
-  if (session.state === CALL_STATES.ENDED) {
-    return { error: 'CALL_ENDED' };
-  }
-
+  if (session.state === CALL_STATES.ENDED) return { error: 'CALL_ENDED' };
   if (session.state !== CALL_STATES.WAITING) {
     console.warn(`[Call ${session.callId}] Unexpected accept in state ${session.state}`);
   }
 
   session.setState(CALL_STATES.CONNECTING);
 
-  const callee = session.callee;
-  const calleeSockets = getUserSockets(callee);
-  calleeSockets.forEach(sid => {
-    if (sid !== calleeSocketId) {
-      io.to(sid).emit('call-cancelled-other-device');
-    }
+  getUserSockets(session.callee).forEach(sid => {
+    if (sid !== calleeSocketId) io.to(sid).emit('call-cancelled-other-device');
   });
 
-  const callerSockets = getUserSockets(session.caller);
-  callerSockets.forEach(sid => {
-    io.to(sid).emit('call-accepted', {
-      callId: session.callId,
-      from: callee,
-    });
+  getUserSockets(session.caller).forEach(sid => {
+    io.to(sid).emit('call-accepted', { callId: session.callId, from: session.callee });
   });
 
   return { success: true };
 }
 
-function rejectCall(session, fromSocketId) {
-  const callerSockets = getUserSockets(session.caller);
-  callerSockets.forEach(sid => {
-    io.to(sid).emit('call-rejected', {
-      callId: session.callId,
-      from: session.callee,
-    });
+function rejectCall(session) {
+  getUserSockets(session.caller).forEach(sid => {
+    io.to(sid).emit('call-rejected', { callId: session.callId, from: session.callee });
   });
-
   endCall(session, 'REJECTED');
   return { success: true };
 }
@@ -757,20 +575,16 @@ function endCall(session, reason = 'NORMAL') {
   if (session.state === CALL_STATES.ENDED) return;
 
   session.setState(CALL_STATES.ENDED);
-  session.endedAt = Date.now();
+  session.endedAt   = Date.now();
   session.endReason = reason;
 
-  // Save to call history
   const callRecord = saveCallToHistory(session, reason);
 
-  // Notify all participants
   [session.caller, session.callee].forEach(user => {
     getUserSockets(user).forEach(sid => {
       io.to(sid).emit('call-ended', {
-        callId: session.callId,
-        reason,
-        duration: callRecord.duration,
-        callRecord,
+        callId: session.callId, reason,
+        duration: callRecord.duration, callRecord,
       });
     });
   });
@@ -779,35 +593,24 @@ function endCall(session, reason = 'NORMAL') {
 }
 
 function handleOffer(session, from, sdp, msgId) {
-  if (!dedupeMessage(msgId)) {
-    return { ignored: true, reason: 'duplicate' };
-  }
+  if (!dedupeMessage(msgId)) return { ignored: true, reason: 'duplicate' };
 
   session.setState(CALL_STATES.NEGOTIATING);
   session.lastOffer = { from, sdp, ts: Date.now() };
 
   const collision = session.lastOffer && session.lastAnswer &&
-                    session.lastOffer.from !== session.lastAnswer.from;
+                     session.lastOffer.from !== session.lastAnswer.from;
 
   if (collision && CONFIG.PERFECT_NEGOTIATION) {
     if (from === session.politePeer) {
-      io.to(getUserSockets(from)[0]).emit('negotiation-rollback', {
-        callId: session.callId,
-        reason: 'collision',
-      });
+      io.to(getUserSockets(from)[0]).emit('negotiation-rollback', { callId: session.callId, reason: 'collision' });
       return { rolledBack: true };
     }
   }
 
   const other = session.getOtherUser(from);
-  const otherSockets = getUserSockets(other);
-  otherSockets.forEach(sid => {
-    io.to(sid).emit('call-offer', {
-      callId: session.callId,
-      from,
-      sdp,
-      msgId,
-    });
+  getUserSockets(other).forEach(sid => {
+    io.to(sid).emit('call-offer', { callId: session.callId, from, sdp, msgId });
   });
 
   clearTimeout(session.timers.negotiation);
@@ -816,9 +619,7 @@ function handleOffer(session, from, sdp, msgId) {
       console.log(`[Call ${session.callId}] Negotiation timeout`);
       session.setState(CALL_STATES.RECOVERING);
       [session.caller, session.callee].forEach(user => {
-        getUserSockets(user).forEach(sid => {
-          io.to(sid).emit('negotiation-timeout', { callId: session.callId });
-        });
+        getUserSockets(user).forEach(sid => io.to(sid).emit('negotiation-timeout', { callId: session.callId }));
       });
     }
   }, CONFIG.NEGOTIATION_TIMEOUT);
@@ -827,48 +628,32 @@ function handleOffer(session, from, sdp, msgId) {
 }
 
 function handleAnswer(session, from, sdp, msgId) {
-  if (!dedupeMessage(msgId)) {
-    return { ignored: true, reason: 'duplicate' };
-  }
+  if (!dedupeMessage(msgId)) return { ignored: true, reason: 'duplicate' };
 
   session.lastAnswer = { from, sdp, ts: Date.now() };
   clearTimeout(session.timers.negotiation);
 
   const other = session.getOtherUser(from);
-  const otherSockets = getUserSockets(other);
-  otherSockets.forEach(sid => {
-    io.to(sid).emit('call-answer', {
-      callId: session.callId,
-      from,
-      sdp,
-      msgId,
-    });
+  getUserSockets(other).forEach(sid => {
+    io.to(sid).emit('call-answer', { callId: session.callId, from, sdp, msgId });
   });
 
   if (session.state === CALL_STATES.NEGOTIATING) {
     session.setState(CALL_STATES.CONNECTED);
-    session.connectedAt = Date.now(); // Mark when call actually connects
+    session.connectedAt = Date.now();
   }
 
   return { success: true };
 }
 
 function handleICE(session, from, candidate, msgId) {
-  if (!dedupeMessage(msgId)) {
-    return { ignored: true, reason: 'duplicate' };
-  }
+  if (!dedupeMessage(msgId)) return { ignored: true, reason: 'duplicate' };
 
   session.iceCandidates[from].push({ candidate, ts: Date.now() });
 
   const other = session.getOtherUser(from);
-  const otherSockets = getUserSockets(other);
-  otherSockets.forEach(sid => {
-    io.to(sid).emit('call-ice', {
-      callId: session.callId,
-      from,
-      candidate,
-      msgId,
-    });
+  getUserSockets(other).forEach(sid => {
+    io.to(sid).emit('call-ice', { callId: session.callId, from, candidate, msgId });
   });
 
   return { success: true };
@@ -876,13 +661,8 @@ function handleICE(session, from, candidate, msgId) {
 
 function recoverSession(socket, callId, userName) {
   const session = sessions.calls.get(callId);
-  if (!session) {
-    return { error: 'SESSION_NOT_FOUND' };
-  }
-
-  if (!session.isParticipant(userName)) {
-    return { error: 'NOT_PARTICIPANT' };
-  }
+  if (!session) return { error: 'SESSION_NOT_FOUND' };
+  if (!session.isParticipant(userName)) return { error: 'NOT_PARTICIPANT' };
 
   session.sockets[userName].add(socket.id);
 
@@ -901,9 +681,7 @@ function recoverSession(socket, callId, userName) {
     polite: userName === session.politePeer,
   };
 
-  if (session.state === CALL_STATES.CONNECTED) {
-    session.setState(CALL_STATES.RECOVERING);
-  }
+  if (session.state === CALL_STATES.CONNECTED) session.setState(CALL_STATES.RECOVERING);
 
   return { success: true, stateSync };
 }
@@ -917,39 +695,24 @@ io.on("connection", (socket) => {
 
   startHealthCheck(socket);
 
-  // Register user
+  // ── Register user ──────────────────────────────────────────────────────────
   socket.on("register", ({ user, callType }) => {
-    // Rate limit check
     const rateCheck = checkRateLimit(user, 'GENERAL');
-    if (!rateCheck.allowed) {
-      return socket.emit("rate-limited", {
-        retryAfter: rateCheck.retryAfter,
-        event: 'register'
-      });
-    }
+    if (!rateCheck.allowed) return socket.emit("rate-limited", { retryAfter: rateCheck.retryAfter, event: 'register' });
 
     const meta = new SocketMeta(socket.id, user);
     sessions.sockets.set(socket.id, meta);
     addUserSocket(user, socket.id);
 
-    socket.data.user = user;
+    socket.data.user     = user;
     socket.data.callType = callType;
 
-    socket.emit("registered", {
-      socketId: socket.id,
-      callType,
-      serverTime: Date.now(),
-    });
-
+    socket.emit("registered", { socketId: socket.id, callType, serverTime: Date.now() });
     console.log(`📋 Registered: ${user} (${getUserSockets(user).length} device(s))`);
-
     broadcastPresence(user, true);
   });
 
-  // ========================
-  // REAL-TIME PRESENCE
-  // ========================
-
+  // ── Presence ───────────────────────────────────────────────────────────────
   socket.on("presence-check", ({ targetUser }) => {
     const isOnline = sessions.users.has(targetUser) && sessions.users.get(targetUser).size > 0;
     socket.emit("presence-status", { user: targetUser, isOnline });
@@ -959,50 +722,28 @@ io.on("connection", (socket) => {
     const user = socket.data.user;
     if (user) {
       const meta = sessions.sockets.get(socket.id);
-      if (meta) {
-        meta.lastActivity = Date.now();
-      }
+      if (meta) meta.lastActivity = Date.now();
     }
   });
 
-  // ========================
-  // TYPING INDICATORS (via Socket.IO - instant, zero Firebase cost)
-  // ========================
-
+  // ── Typing indicators via Socket.IO ───────────────────────────────────────
   socket.on("typing-start", ({ chatId, user }) => {
-    // Rate limit
     const rateCheck = checkRateLimit(user, 'TYPING');
     if (!rateCheck.allowed) return;
-
     const otherUser = user === 'Vishwa' ? 'Ammu' : 'Vishwa';
-    const otherSockets = getUserSockets(otherUser);
-    otherSockets.forEach(sid => {
-      io.to(sid).emit("typing-update", {
-        user,
-        isTyping: true,
-        chatId,
-        timestamp: Date.now(),
-      });
+    getUserSockets(otherUser).forEach(sid => {
+      io.to(sid).emit("typing-update", { user, isTyping: true, chatId, timestamp: Date.now() });
     });
   });
 
   socket.on("typing-stop", ({ chatId, user }) => {
     const otherUser = user === 'Vishwa' ? 'Ammu' : 'Vishwa';
-    const otherSockets = getUserSockets(otherUser);
-    otherSockets.forEach(sid => {
-      io.to(sid).emit("typing-update", {
-        user,
-        isTyping: false,
-        chatId,
-        timestamp: Date.now(),
-      });
+    getUserSockets(otherUser).forEach(sid => {
+      io.to(sid).emit("typing-update", { user, isTyping: false, chatId, timestamp: Date.now() });
     });
   });
 
-  // ========================
-  // FCM TOKEN REGISTRATION
-  // ========================
-
+  // ── FCM token registration ────────────────────────────────────────────────
   socket.on("fcm-register", ({ user, token }) => {
     if (user && token) {
       sessions.fcmTokens.set(user, token);
@@ -1010,31 +751,18 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ========================
-  // CALL INITIATION
-  // ========================
-
+  // ── Call initiation ───────────────────────────────────────────────────────
   socket.on("call-user", ({ to, type }) => {
     const from = socket.data.user;
     if (!from) return socket.emit("error", { message: "Not registered" });
 
-    // Rate limit
     const rateCheck = checkRateLimit(from, 'CALLS');
-    if (!rateCheck.allowed) {
-      return socket.emit("rate-limited", {
-        retryAfter: rateCheck.retryAfter,
-        event: 'call-user'
-      });
-    }
+    if (!rateCheck.allowed) return socket.emit("rate-limited", { retryAfter: rateCheck.retryAfter, event: 'call-user' });
 
     const result = createCallSession(type, from, to);
-
     if (result.error) {
-      if (result.error === 'CALL_EXISTS') {
-        socket.emit("call-exists", { callId: result.callId });
-      } else {
-        socket.emit("call-failed", { error: result.error });
-      }
+      if (result.error === 'CALL_EXISTS') socket.emit("call-exists", { callId: result.callId });
+      else socket.emit("call-failed", { error: result.error });
       return;
     }
 
@@ -1042,8 +770,7 @@ io.on("connection", (socket) => {
     session.sockets[from].add(socket.id);
     sessions.sockets.get(socket.id).callId = session.callId;
 
-    const initResult = initiateCall(session, socket.id);
-
+    const initResult = initiateCall(session);
     if (initResult.error) {
       socket.emit("call-failed", { error: initResult.error });
       cleanupSession(session.callId);
@@ -1051,200 +778,164 @@ io.on("connection", (socket) => {
     }
 
     socket.emit("call-initiated", {
-      callId: session.callId,
-      type: session.type,
-      to,
+      callId: session.callId, type: session.type, to,
       polite: from === session.politePeer,
     });
   });
 
-  // Accept incoming call
   socket.on("call-accept", ({ callId }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (!session || !session.isParticipant(from)) {
-      return socket.emit("error", { message: "Invalid call" });
-    }
+    if (!session || !session.isParticipant(from)) return socket.emit("error", { message: "Invalid call" });
 
     session.sockets[from].add(socket.id);
     sessions.sockets.get(socket.id).callId = callId;
-
     acceptCall(session, socket.id);
   });
 
-  // Reject call
   socket.on("call-reject", ({ callId }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (!session || !session.isParticipant(from)) {
-      return;
-    }
-
-    rejectCall(session, socket.id);
+    if (session && session.isParticipant(from)) rejectCall(session);
   });
 
-  // End call
   socket.on("call-end", ({ callId }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (session && session.isParticipant(from)) {
-      endCall(session, 'ENDED_BY_USER');
-    }
+    if (session && session.isParticipant(from)) endCall(session, 'ENDED_BY_USER');
   });
 
-  // ========================
-  // WEBRTC SIGNALING
-  // ========================
-
+  // ── WebRTC signaling ───────────────────────────────────────────────────────
   socket.on("call-offer", ({ callId, sdp, msgId }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (!session || !session.isParticipant(from)) {
-      return;
-    }
-
-    handleOffer(session, from, sdp, msgId || generateMessageId());
+    if (session && session.isParticipant(from)) handleOffer(session, from, sdp, msgId || generateMessageId());
   });
 
   socket.on("call-answer", ({ callId, sdp, msgId }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (!session || !session.isParticipant(from)) {
-      return;
-    }
-
-    handleAnswer(session, from, sdp, msgId || generateMessageId());
+    if (session && session.isParticipant(from)) handleAnswer(session, from, sdp, msgId || generateMessageId());
   });
 
   socket.on("call-ice", ({ callId, candidate, msgId }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (!session || !session.isParticipant(from)) {
-      return;
-    }
-
-    handleICE(session, from, candidate, msgId || generateMessageId());
+    if (session && session.isParticipant(from)) handleICE(session, from, candidate, msgId || generateMessageId());
   });
 
-  // ========================
-  // PERFECT NEGOTIATION
-  // ========================
-
+  // ── Perfect negotiation ────────────────────────────────────────────────────
   socket.on("nego-rollback", ({ callId }) => {
     const session = sessions.calls.get(callId);
-    if (session && session.state === CALL_STATES.NEGOTIATING) {
-      console.log(`[Call ${callId}] Rollback performed`);
-    }
+    if (session && session.state === CALL_STATES.NEGOTIATING) console.log(`[Call ${callId}] Rollback performed`);
   });
 
   socket.on("nego-needed", ({ callId }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (!session || !session.isParticipant(from)) {
-      return;
-    }
-
+    if (!session || !session.isParticipant(from)) return;
     const other = session.getOtherUser(from);
-    getUserSockets(other).forEach(sid => {
-      io.to(sid).emit('nego-needed', { callId, from });
-    });
+    getUserSockets(other).forEach(sid => io.to(sid).emit('nego-needed', { callId, from }));
   });
 
-  // ========================
-  // SESSION RECOVERY
-  // ========================
-
+  // ── Session recovery ───────────────────────────────────────────────────────
   socket.on("session-recover", ({ callId }) => {
     const user = socket.data.user;
     if (!user) return;
-
     const result = recoverSession(socket, callId, user);
-
     if (result.error) {
       socket.emit("session-recover-failed", { callId, error: result.error });
     } else {
       socket.emit("session-recovered", result.stateSync);
-
       const session = sessions.calls.get(callId);
       const other = session.getOtherUser(user);
-      getUserSockets(other).forEach(sid => {
-        io.to(sid).emit('peer-recovered', { callId, user });
-      });
+      getUserSockets(other).forEach(sid => io.to(sid).emit('peer-recovered', { callId, user }));
     }
   });
 
-  // ========================
-  // MEDIA STATE
-  // ========================
-
+  // ── Media state ────────────────────────────────────────────────────────────
   socket.on("media-state", ({ callId, video, audio }) => {
     const from = socket.data.user;
     const session = sessions.calls.get(callId);
-
-    if (!session || !session.isParticipant(from)) {
-      return;
-    }
-
+    if (!session || !session.isParticipant(from)) return;
     session.mediaState[from] = { video, audio };
-
     const other = session.getOtherUser(from);
-    getUserSockets(other).forEach(sid => {
-      io.to(sid).emit('peer-media-state', { callId, from, video, audio });
-    });
+    getUserSockets(other).forEach(sid => io.to(sid).emit('peer-media-state', { callId, from, video, audio }));
   });
 
-  // ========================
-  // CAMERA SHARING (Legacy Support)
-  // ========================
-
+  // ── Camera sharing ─────────────────────────────────────────────────────────
   socket.on("join", ({ room, user }) => {
     socket.join(room);
     socket.data.room = room;
     socket.data.videoUser = user;
-    socket.emit("joined", { room });
+    if (!cameraRooms[room]) cameraRooms[room] = {};
+    cameraRooms[room][socket.id] = user;
+    const count = Object.keys(cameraRooms[room]).length;
+    socket.emit("joined", { room, count });
+    if (count > 1) {
+      Object.entries(cameraRooms[room]).forEach(([sid, name]) => {
+        if (sid !== socket.id && name === "Vishwa") io.to(sid).emit("request-offer", { to: user });
+      });
+    }
   });
 
-  socket.on("camera-ready", ({ room, from }) => {
-    socket.to(room).emit("camera-ready", { from });
+  socket.on("camera-ready", ({ room, from })        => socket.to(room).emit("camera-ready", { from }));
+  socket.on("offer",        ({ room, from, sdp })   => socket.to(room).emit("offer",  { from, sdp }));
+  socket.on("answer",       ({ room, from, sdp })   => socket.to(room).emit("answer", { from, sdp }));
+  socket.on("ice",          ({ room, from, candidate }) => socket.to(room).emit("ice", { from, candidate }));
+  socket.on("camera-off",   ({ room, from })        => socket.to(room).emit("camera-off", { from }));
+
+  // ════════════════════════════════════════════════════════════════════════
+  // SCREEN SHARE SIGNALING (NEW)
+  // ════════════════════════════════════════════════════════════════════════
+
+  socket.on("share-join", ({ room, user }) => {
+    const rateCheck = checkRateLimit(user, 'SCREEN_SHARE');
+    if (!rateCheck.allowed) return socket.emit("rate-limited", { retryAfter: rateCheck.retryAfter, event: 'share-join' });
+
+    socket.join(room);
+    socket.data.shareRoom = room;
+    socket.data.shareUser = user;
+    if (!shareRooms[room]) shareRooms[room] = {};
+    shareRooms[room][socket.id] = user;
+    const count = Object.keys(shareRooms[room]).length;
+    socket.emit("share-joined", { room, count });
+    console.log(`🖥️ ${user} joined screen-share room (${count} device(s))`);
   });
 
-  socket.on("offer", ({ room, from, sdp }) => {
-    socket.to(room).emit("offer", { from, sdp });
+  socket.on("share-ready", ({ room, from }) => {
+    console.log(`🖥️ share-ready from ${from}`);
+    socket.to(room).emit("share-ready", { from });
   });
 
-  socket.on("answer", ({ room, from, sdp }) => {
-    socket.to(room).emit("answer", { from, sdp });
+  socket.on("share-offer", ({ room, from, sdp }) => {
+    console.log(`🖥️ share-offer from ${from}`);
+    socket.to(room).emit("share-offer", { from, sdp });
   });
 
-  socket.on("ice", ({ room, from, candidate }) => {
-    socket.to(room).emit("ice", { from, candidate });
+  socket.on("share-answer", ({ room, from, sdp }) => {
+    console.log(`🖥️ share-answer from ${from}`);
+    socket.to(room).emit("share-answer", { from, sdp });
   });
 
-  socket.on("camera-off", ({ room, from }) => {
-    socket.to(room).emit("camera-off", { from });
+  socket.on("share-ice", ({ room, from, candidate }) => {
+    socket.to(room).emit("share-ice", { from, candidate });
   });
 
-  // ========================
-  // LEGACY VOICE CALL SUPPORT
-  // ========================
+  socket.on("share-off", ({ room, from }) => {
+    console.log(`🖥️ share-off from ${from}`);
+    socket.to(room).emit("share-off", { from });
+    if (room && shareRooms[room]) {
+      // Don't delete socket entry here — disconnect handler manages cleanup
+    }
+  });
 
+  // ── Legacy voice call support ──────────────────────────────────────────────
   socket.on("call-user-legacy", ({ to, from }) => {
     console.log(`📞 Legacy call: ${from} -> ${to}`);
     const targetSockets = getUserSockets(to);
-    if (targetSockets.length === 0) {
-      socket.emit('call-user-offline');
-      return;
-    }
-    targetSockets.forEach(sid => {
-      io.to(sid).emit('call-incoming', { from, type: 'voice' });
-    });
+    if (targetSockets.length === 0) { socket.emit('call-user-offline'); return; }
+    targetSockets.forEach(sid => io.to(sid).emit('call-incoming', { from, type: 'voice' }));
   });
 
   socket.on("call-accept-legacy", ({ room, from }) => {
@@ -1252,70 +943,39 @@ io.on("connection", (socket) => {
     socket.to(room).emit("call-accepted", { from });
   });
 
-  socket.on("call-reject-legacy", ({ room, from }) => {
-    socket.to(room).emit("call-rejected", { from });
-  });
+  socket.on("call-reject-legacy",     ({ room, from }) => socket.to(room).emit("call-rejected", { from }));
+  socket.on("call-end-legacy",        ({ room, from }) => socket.to(room).emit("call-ended", { from }));
+  socket.on("call-offer-legacy",      ({ room, from, sdp }) => socket.to(room).emit("call-offer", { from, sdp }));
+  socket.on("call-answer-legacy",     ({ room, from, sdp }) => socket.to(room).emit("call-answer", { from, sdp }));
+  socket.on("call-ice-legacy",        ({ room, from, candidate }) => socket.to(room).emit("call-ice", { from, candidate }));
 
-  socket.on("call-end-legacy", ({ room, from }) => {
-    socket.to(room).emit("call-ended", { from });
-  });
-
-  socket.on("call-offer-legacy", ({ room, from, sdp }) => {
-    socket.to(room).emit("call-offer", { from, sdp });
-  });
-
-  socket.on("call-answer-legacy", ({ room, from, sdp }) => {
-    socket.to(room).emit("call-answer", { from, sdp });
-  });
-
-  socket.on("call-ice-legacy", ({ room, from, candidate }) => {
-    socket.to(room).emit("call-ice", { from, candidate });
-  });
-
-  // ========================
-  // HUG SYNC
-  // ========================
-
+  // ── Hug sync ───────────────────────────────────────────────────────────────
   socket.on('hug-sync-initiate', (hugData) => {
     console.log(`🫂 Hug sync initiated:`, hugData);
-
     const initiatorSockets = getUserSockets(hugData.initiator);
     const responderSockets = getUserSockets(hugData.responder);
-
     if (initiatorSockets.length > 0 && responderSockets.length > 0) {
       initiatorSockets.forEach(sid => io.to(sid).emit('hug-sync-vibrate', hugData));
       responderSockets.forEach(sid => io.to(sid).emit('hug-sync-vibrate', hugData));
-      console.log(`🫂 Synchronized hug sent to ${hugData.initiator} and ${hugData.responder}`);
+      console.log(`🫂 Synchronized hug sent`);
     } else {
       console.log(`❌ Hug sync failed: One or both users not connected`);
     }
   });
 
-  // ========================
-  // MESSAGE READ EVENTS
-  // ========================
-
+  // ── Message read events ────────────────────────────────────────────────────
   socket.on('messages-read', ({ messageIds, readBy, senderIds }) => {
-    // Rate limit
     const rateCheck = checkRateLimit(readBy, 'MESSAGES');
     if (!rateCheck.allowed) return;
-
     console.log(`📖 Messages read by ${readBy}:`, messageIds);
-
     senderIds.forEach(senderId => {
-      const senderSockets = getUserSockets(senderId);
-      senderSockets.forEach(sid => {
-        io.to(sid).emit('message-seen-confirmation', { messageIds, readBy });
-      });
+      getUserSockets(senderId).forEach(sid => io.to(sid).emit('message-seen-confirmation', { messageIds, readBy }));
     });
   });
 
-  // ========================
-  // DISCONNECT
-  // ========================
-
+  // ── Disconnect ─────────────────────────────────────────────────────────────
   socket.on("disconnect", (reason) => {
-    const user = socket.data.user || socket.data.videoUser;
+    const user   = socket.data.user || socket.data.videoUser;
     const callId = sessions.sockets.get(socket.id)?.callId;
 
     console.log(`🔌 Disconnected: ${socket.id} (${user}) - ${reason}`);
@@ -1324,35 +984,24 @@ io.on("connection", (socket) => {
 
     if (user) {
       removeUserSocket(user, socket.id);
-
-      const remainingSockets = getUserSockets(user);
-      if (remainingSockets.length === 0) {
-        broadcastPresence(user, false);
-      }
+      if (getUserSockets(user).length === 0) broadcastPresence(user, false);
 
       if (callId) {
         const session = sessions.calls.get(callId);
         if (session && session.isParticipant(user)) {
           session.sockets[user].delete(socket.id);
-
           const userSockets = getUserSockets(user);
 
           if (userSockets.length === 0) {
             const other = session.getOtherUser(user);
             getUserSockets(other).forEach(sid => {
-              io.to(sid).emit('peer-disconnected', {
-                callId,
-                user,
-                state: session.state,
-              });
+              io.to(sid).emit('peer-disconnected', { callId, user, state: session.state });
             });
 
             if (CONFIG.SESSION_PERSISTENCE) {
               clearTimeout(session.timers.reconnect);
               session.timers.reconnect = setTimeout(() => {
-                if (session.state === CALL_STATES.CONNECTED ||
-                    session.state === CALL_STATES.RECOVERING ||
-                    session.state === CALL_STATES.RECONNECTING) {
+                if ([CALL_STATES.CONNECTED, CALL_STATES.RECOVERING, CALL_STATES.RECONNECTING].includes(session.state)) {
                   console.log(`[Call ${callId}] Reconnect timeout for ${user}`);
                   endCall(session, 'RECONNECT_TIMEOUT');
                 }
@@ -1365,9 +1014,25 @@ io.on("connection", (socket) => {
       }
     }
 
+    // Camera room cleanup
     const room = socket.data.room;
-    if (room) {
-      socket.to(room).emit("camera-off", { from: user });
+    if (room && cameraRooms[room]) {
+      delete cameraRooms[room][socket.id];
+      if (Object.keys(cameraRooms[room]).length === 0) delete cameraRooms[room];
+      else socket.to(room).emit("camera-off", { from: user });
+    }
+
+    // Screen share room cleanup
+    const shareRoom = socket.data.shareRoom;
+    const shareUser = socket.data.shareUser;
+    if (shareRoom && shareRooms[shareRoom]) {
+      delete shareRooms[shareRoom][socket.id];
+      if (Object.keys(shareRooms[shareRoom]).length === 0) {
+        delete shareRooms[shareRoom];
+      } else {
+        socket.to(shareRoom).emit("share-off", { from: shareUser });
+      }
+      console.log(`🖥️ ${shareUser} left screen-share room`);
     }
   });
 });
@@ -1378,22 +1043,14 @@ io.on("connection", (socket) => {
 
 setInterval(() => {
   const now = Date.now();
-
   for (const [callId, session] of sessions.calls) {
-    if (session.state === CALL_STATES.ENDED) {
-      const age = now - session.updatedAt;
-      if (age > CONFIG.SESSION_TTL) {
-        cleanupSession(callId);
-      }
+    if (session.state === CALL_STATES.ENDED && now - session.updatedAt > CONFIG.SESSION_TTL) {
+      cleanupSession(callId);
     }
   }
-
   for (const [msgId, ts] of sessions.messageCache) {
-    if (now - ts > CONFIG.MESSAGE_DEDUP_TTL) {
-      sessions.messageCache.delete(msgId);
-    }
+    if (now - ts > CONFIG.MESSAGE_DEDUP_TTL) sessions.messageCache.delete(msgId);
   }
-
 }, 60000);
 
 // ============================================================================
@@ -1402,24 +1059,12 @@ setInterval(() => {
 
 process.on('SIGTERM', () => {
   console.log('🛑 SIGTERM received, shutting down gracefully');
-  io.close(() => {
-    console.log('✅ All connections closed');
-    server.close(() => {
-      console.log('✅ Server closed');
-      process.exit(0);
-    });
-  });
+  io.close(() => server.close(() => process.exit(0)));
 });
 
 process.on('SIGINT', () => {
   console.log('🛑 SIGINT received, shutting down gracefully');
-  io.close(() => {
-    console.log('✅ All connections closed');
-    server.close(() => {
-      console.log('✅ Server closed');
-      process.exit(0);
-    });
-  });
+  io.close(() => server.close(() => process.exit(0)));
 });
 
 // ============================================================================
@@ -1428,7 +1073,7 @@ process.on('SIGINT', () => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 Signaling Server v3.0 on port ${PORT}`);
+  console.log(`🚀 Signaling Server v3.1 on port ${PORT}`);
   console.log(`   Health Check: http://localhost:${PORT}/health`);
-  console.log(`   Features: Rate Limiting, Typing via Socket, Call History, Mood Cleanup, FCM`);
+  console.log(`   Features: Rate Limiting, Typing via Socket, Call History, Mood Cleanup, FCM, Screen Share`);
 });
