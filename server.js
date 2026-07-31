@@ -1,5 +1,5 @@
 /**
- * server.js — Production-Grade Signaling Server v3.1
+ * server.js — Production-Grade Signaling Server v3.2
  *
  * Architecture:
  * 1. Call State Machine — prevents race conditions, invalid states
@@ -15,7 +15,7 @@
  * 11. Typing via Socket.IO — zero latency
  * 12. Mood Cleanup — server-side expiry
  * 13. FCM Push Notifications — server-side sending
- * 14. Screen Sharing — NEW: full desktop/window sharing with audio
+ * 14. Screen Sharing — full desktop/window sharing with audio + viewer-join signal
  *
  * Note: Uses Node.js built-in fetch (Node 18+) — no node-fetch package needed
  */
@@ -147,10 +147,10 @@ const sessions = {
   fcmTokens:    new Map(),
 };
 
-// NEW: Screen share room state (separate from camera rooms)
+// Screen share room state (separate from camera rooms)
 const shareRooms = {}; // { roomId: { socketId: userName } }
 
-// Camera sharing room state (existing)
+// Camera sharing room state
 const cameraRooms = {}; // { roomId: { socketId: userName } }
 
 class CallSession {
@@ -448,11 +448,11 @@ const io = new Server(server, {
 // EXPRESS ROUTES
 // ============================================================================
 
-app.get("/", (req, res) => res.send("Signaling Server v3.1 - Ready"));
+app.get("/", (req, res) => res.send("Signaling Server v3.2 - Ready"));
 
 app.get("/health", (req, res) => res.json({
   ok: true,
-  version: "3.1",
+  version: "3.2",
   uptime: process.uptime(),
   activeCalls: sessions.calls.size,
   connectedSockets: sessions.sockets.size,
@@ -886,7 +886,7 @@ io.on("connection", (socket) => {
   socket.on("camera-off",   ({ room, from })        => socket.to(room).emit("camera-off", { from }));
 
   // ════════════════════════════════════════════════════════════════════════
-  // SCREEN SHARE SIGNALING (NEW)
+  // SCREEN SHARE SIGNALING
   // ════════════════════════════════════════════════════════════════════════
 
   socket.on("share-join", ({ room, user }) => {
@@ -908,6 +908,12 @@ io.on("connection", (socket) => {
     socket.to(room).emit("share-ready", { from });
   });
 
+  // ── KEY FIX: viewer announces readiness → sharer sends offer ────────────────
+  socket.on("share-viewer-join", ({ room, from }) => {
+    console.log(`🖥️ Viewer ${from} announced readiness`);
+    socket.to(room).emit("share-viewer-join", { from });
+  });
+
   socket.on("share-offer", ({ room, from, sdp }) => {
     console.log(`🖥️ share-offer from ${from}`);
     socket.to(room).emit("share-offer", { from, sdp });
@@ -925,9 +931,6 @@ io.on("connection", (socket) => {
   socket.on("share-off", ({ room, from }) => {
     console.log(`🖥️ share-off from ${from}`);
     socket.to(room).emit("share-off", { from });
-    if (room && shareRooms[room]) {
-      // Don't delete socket entry here — disconnect handler manages cleanup
-    }
   });
 
   // ── Legacy voice call support ──────────────────────────────────────────────
@@ -1073,7 +1076,7 @@ process.on('SIGINT', () => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 Signaling Server v3.1 on port ${PORT}`);
+  console.log(`🚀 Signaling Server v3.2 on port ${PORT}`);
   console.log(`   Health Check: http://localhost:${PORT}/health`);
   console.log(`   Features: Rate Limiting, Typing via Socket, Call History, Mood Cleanup, FCM, Screen Share`);
 });
