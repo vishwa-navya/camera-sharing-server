@@ -149,6 +149,7 @@ const sessions = {
 
 // Screen share room state (separate from camera rooms)
 const shareRooms = {}; // { roomId: { socketId: userName } }
+const activeSharers = {}; // { roomId: userName } — tracks WHO is currently sharing
 
 // Camera sharing room state
 const cameraRooms = {}; // { roomId: { socketId: userName } }
@@ -901,17 +902,30 @@ io.on("connection", (socket) => {
     const count = Object.keys(shareRooms[room]).length;
     socket.emit("share-joined", { room, count });
     console.log(`🖥️ ${user} joined screen-share room (${count} device(s))`);
+
+    // KEY FIX: If someone is ALREADY actively sharing when this user joins,
+    // tell THIS socket directly (not broadcast) so late joiners immediately
+    // know a share is in progress and can signal readiness.
+    const sharer = activeSharers[room];
+    if (sharer && sharer !== user) {
+      console.log(`🖥️ Telling late joiner ${user} that ${sharer} is already sharing`);
+      socket.emit("share-active", { from: sharer });
+    }
   });
 
-  socket.on("share-ready", ({ room, from }) => {
-    console.log(`🖥️ share-ready from ${from}`);
-    socket.to(room).emit("share-ready", { from });
+  // Sharer announces they are actively sharing — server REMEMBERS this
+  // so any viewer who joins later (even seconds/minutes after) gets told
+  // immediately via the share-join handler above.
+  socket.on("share-active", ({ room, from }) => {
+    console.log(`🖥️ share-active: ${from} is now sharing in ${room}`);
+    activeSharers[room] = from;
+    socket.to(room).emit("share-active", { from });
   });
 
-  // ── KEY FIX: viewer announces readiness → sharer sends offer ────────────────
-  socket.on("share-viewer-join", ({ room, from }) => {
-    console.log(`🖥️ Viewer ${from} announced readiness`);
-    socket.to(room).emit("share-viewer-join", { from });
+  // Viewer signals they are ready to receive the offer
+  socket.on("share-viewer-ready", ({ room, from }) => {
+    console.log(`🖥️ Viewer ${from} is ready to receive`);
+    socket.to(room).emit("share-viewer-ready", { from });
   });
 
   socket.on("share-offer", ({ room, from, sdp }) => {
@@ -930,6 +944,11 @@ io.on("connection", (socket) => {
 
   socket.on("share-off", ({ room, from }) => {
     console.log(`🖥️ share-off from ${from}`);
+    // If the person stopping is the active sharer, clear the room's active state
+    if (activeSharers[room] === from) {
+      delete activeSharers[room];
+      console.log(`🖥️ Cleared active sharer for room ${room}`);
+    }
     socket.to(room).emit("share-off", { from });
   });
 
@@ -1030,8 +1049,16 @@ io.on("connection", (socket) => {
     const shareUser = socket.data.shareUser;
     if (shareRoom && shareRooms[shareRoom]) {
       delete shareRooms[shareRoom][socket.id];
+
+      // If the disconnecting user was the active sharer, clear it and notify viewers
+      if (activeSharers[shareRoom] === shareUser) {
+        delete activeSharers[shareRoom];
+        console.log(`🖥️ Active sharer ${shareUser} disconnected — cleared`);
+      }
+
       if (Object.keys(shareRooms[shareRoom]).length === 0) {
         delete shareRooms[shareRoom];
+        delete activeSharers[shareRoom];
       } else {
         socket.to(shareRoom).emit("share-off", { from: shareUser });
       }
