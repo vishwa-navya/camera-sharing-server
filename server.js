@@ -16,6 +16,7 @@
  * 12. Mood Cleanup — server-side expiry
  * 13. FCM Push Notifications — server-side sending
  * 14. Screen Sharing — full desktop/window sharing with audio + viewer-join signal
+ * 15. Scheduled Photo Delivery — backend worker, cold-start safe, free-tier friendly
  *
  * Note: Uses Node.js built-in fetch (Node 18+) — no node-fetch package needed
  */
@@ -459,11 +460,14 @@ app.get("/health", (req, res) => res.json({
   connectedSockets: sessions.sockets.size,
   callHistoryCount: sessions.callHistory.length,
   activeScreenShares: Object.keys(shareRooms).length,
+  scheduledPhotos: getScheduledPhotoStatus(),
 }));
 
 app.post("/wake", express.json(), (req, res) => {
   res.json({ awake: true, ts: Date.now() });
   console.log('[Wake] Server woke up');
+  // Cold start / app opened: deliver anything that became due while we slept
+  deliverDuePhotos('wake').catch(() => {});
 });
 
 app.get("/call-history/:user", async (req, res) => {
@@ -501,6 +505,173 @@ setInterval(async () => {
     console.log("⚠️ Self-ping failed:", e.message);
   }
 }, 9 * 60 * 1000);
+
+// ============================================================================
+// SCHEDULED PHOTO DELIVERY (backend worker)
+// ============================================================================
+//
+// Scheduled photos are stored in the Supabase table `scheduled_photo_messages`.
+// This worker asks the Supabase Edge Function `deliver-scheduled-photos` to send
+// every photo whose time has arrived — it works even if both users are offline.
+//
+// Set these two environment variables in Render → Environment:
+//   SUPABASE_URL       = same value as VITE_SUPABASE_URL  (https://xxxx.supabase.co)
+//   SUPABASE_ANON_KEY  = same value as VITE_SUPABASE_ANON_KEY
+//
+// Why this is safe for the Render FREE plan and cold starts:
+//  • It adds NO extra instance hours. It only runs while this service is already
+//    awake (the self-ping above already keeps it awake). It never pings itself
+//    and never starts another service.
+//  • Cost while idle: ONE tiny HTTPS request per minute (~43,000/month), no
+//    database connection, no memory growth.
+//  • Cold start: on every boot the worker immediately runs a CATCH-UP check
+//    (after 3s), so photos that became due while the server slept or restarted
+//    are delivered right away. /wake (called when the app opens) and /tick (for
+//    an optional free pinger) trigger the same catch-up.
+//  • Failures back off (1 → 2 → 4 → 5 min) so a Supabase outage never hammers
+//    the network or burns CPU.
+//  • Delivery is idempotent on the Supabase side (one Firestore document per
+//    scheduled photo), so overlapping triggers can never send a photo twice.
+
+const SCHEDULED_PHOTOS = {
+  SUPABASE_URL:       (process.env.SUPABASE_URL || "").replace(/\/+$/, ""),
+  SUPABASE_ANON_KEY:  process.env.SUPABASE_ANON_KEY || "",
+  POLL_INTERVAL:      60 * 1000,   // regular check: once a minute
+  STARTUP_DELAY:      3 * 1000,    // catch-up check after boot / cold start
+  REQUEST_TIMEOUT:    30 * 1000,   // Supabase function may be slow on its own cold start
+  MIN_GAP_MANUAL:     10 * 1000,   // coalesce rapid /wake and /tick calls
+  MAX_BACKOFF:        5 * 60 * 1000,
+};
+
+const scheduledPhotoState = {
+  running:             false,
+  lastStartedAt:       0,
+  lastFinishedAt:      null,
+  lastReason:          null,
+  lastResult:          null,
+  lastError:           null,
+  consecutiveFailures: 0,
+  nextPollAllowedAt:   0,
+  totalChecks:         0,
+  totalDelivered:      0,
+  pollTimer:           null,
+};
+
+function isScheduledPhotoConfigured() {
+  return Boolean(SCHEDULED_PHOTOS.SUPABASE_URL && SCHEDULED_PHOTOS.SUPABASE_ANON_KEY);
+}
+
+function getScheduledPhotoStatus() {
+  return {
+    configured:          isScheduledPhotoConfigured(),
+    running:             scheduledPhotoState.running,
+    lastReason:          scheduledPhotoState.lastReason,
+    lastFinishedAt:      scheduledPhotoState.lastFinishedAt,
+    lastResult:          scheduledPhotoState.lastResult,
+    lastError:           scheduledPhotoState.lastError,
+    consecutiveFailures: scheduledPhotoState.consecutiveFailures,
+    totalChecks:         scheduledPhotoState.totalChecks,
+    totalDelivered:      scheduledPhotoState.totalDelivered,
+  };
+}
+
+/**
+ * Ask Supabase to deliver every photo that is due.
+ * reason: 'poll' (timer) | 'startup' (boot catch-up) | 'wake' | 'tick'
+ * Never throws — always resolves with a small result object.
+ */
+async function deliverDuePhotos(reason = 'poll') {
+  if (!isScheduledPhotoConfigured()) {
+    return { skipped: 'SUPABASE_URL / SUPABASE_ANON_KEY not set' };
+  }
+
+  const state = scheduledPhotoState;
+  const now   = Date.now();
+
+  if (state.running) return { skipped: 'already running' };
+  if (reason === 'poll' && now < state.nextPollAllowedAt) return { skipped: 'backing off' };
+  if ((reason === 'wake' || reason === 'tick') && now - state.lastStartedAt < SCHEDULED_PHOTOS.MIN_GAP_MANUAL) {
+    return { skipped: 'checked moments ago' };
+  }
+
+  state.running       = true;
+  state.lastStartedAt = now;
+  state.lastReason    = reason;
+  state.totalChecks  += 1;
+
+  try {
+    const res = await fetch(`${SCHEDULED_PHOTOS.SUPABASE_URL}/functions/v1/deliver-scheduled-photos`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${SCHEDULED_PHOTOS.SUPABASE_ANON_KEY}`,
+        "apikey":        SCHEDULED_PHOTOS.SUPABASE_ANON_KEY,
+      },
+      body:   "{}",
+      signal: AbortSignal.timeout(SCHEDULED_PHOTOS.REQUEST_TIMEOUT),
+    });
+
+    const text = await res.text();
+    let result;
+    try { result = JSON.parse(text); } catch { result = { raw: text.slice(0, 200) }; }
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+
+    state.consecutiveFailures = 0;
+    state.nextPollAllowedAt   = 0;
+    state.lastError           = null;
+    state.lastResult          = { claimed: result.claimed || 0, delivered: result.delivered || 0, retried: result.retried || 0 };
+    state.totalDelivered     += result.delivered || 0;
+
+    if (result.claimed) {
+      console.log(`📷 [ScheduledPhotos/${reason}] claimed ${result.claimed}, delivered ${result.delivered}, retried ${result.retried}`);
+      if (Array.isArray(result.errors) && result.errors.length) {
+        console.log(`⚠️ [ScheduledPhotos] delivery errors: ${result.errors.join(' | ').slice(0, 300)}`);
+      }
+    }
+    return state.lastResult;
+  } catch (err) {
+    state.consecutiveFailures += 1;
+    const backoff = Math.min(
+      SCHEDULED_PHOTOS.MAX_BACKOFF,
+      SCHEDULED_PHOTOS.POLL_INTERVAL * Math.pow(2, state.consecutiveFailures - 1)
+    );
+    state.nextPollAllowedAt = Date.now() + backoff;
+    state.lastError         = err.message;
+    console.log(`⚠️ [ScheduledPhotos/${reason}] check failed (#${state.consecutiveFailures}): ${err.message}`);
+    return { error: err.message };
+  } finally {
+    state.running        = false;
+    state.lastFinishedAt = new Date().toISOString();
+  }
+}
+
+function startScheduledPhotoWorker() {
+  if (!isScheduledPhotoConfigured()) {
+    console.log("ℹ️ Scheduled photos: set SUPABASE_URL and SUPABASE_ANON_KEY in Render to enable the backend worker");
+    return;
+  }
+  if (scheduledPhotoState.pollTimer) return;
+
+  console.log("⏰ Scheduled photo worker started (catch-up in 3s, then every 60s)");
+
+  // Cold-start / restart catch-up: deliver anything that became due while asleep
+  setTimeout(() => deliverDuePhotos('startup').catch(() => {}), SCHEDULED_PHOTOS.STARTUP_DELAY);
+
+  scheduledPhotoState.pollTimer = setInterval(
+    () => deliverDuePhotos('poll').catch(() => {}),
+    SCHEDULED_PHOTOS.POLL_INTERVAL
+  );
+}
+
+// Optional: call from a free pinger (cron-job.org / UptimeRobot) to wake the
+// server and deliver anything due. Not required while the self-ping is active.
+app.all("/tick", async (req, res) => {
+  const result = await deliverDuePhotos('tick');
+  res.json({ ok: true, result, status: getScheduledPhotoStatus() });
+});
+
+app.get("/schedule-status", (req, res) => res.json(getScheduledPhotoStatus()));
 
 // ============================================================================
 // CALL MANAGEMENT
@@ -1105,5 +1276,6 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🚀 Signaling Server v3.2 on port ${PORT}`);
   console.log(`   Health Check: http://localhost:${PORT}/health`);
-  console.log(`   Features: Rate Limiting, Typing via Socket, Call History, Mood Cleanup, FCM, Screen Share`);
+  console.log(`   Features: Rate Limiting, Typing via Socket, Call History, Mood Cleanup, FCM, Screen Share, Scheduled Photos`);
+  startScheduledPhotoWorker();
 });
